@@ -2,8 +2,11 @@
 Joint nested sampling: knot + extended jet.
 Runs all 4 jet models and compares Bayesian evidence.
 
-Shared (sampled) parameters: G0, p, Lj
+Shared (sampled): theta
+Per-component (sampled): log10_Lj_knot, log10_Lj_ext, G0_knot, G0_ext
 Per-component fixed geometry: Rj, l set from observations.
+
+Physical parameters from arXiv:1509.04822 (B3 0727+409, z=2.5).
 """
 
 import jax
@@ -26,7 +29,7 @@ from lumen import (
 #  Data                                                               #
 # ------------------------------------------------------------------ #
 
-cosmo = make_cosmology(70.0, 0.3, 0.7)
+cosmo = make_cosmology(71.0, 0.27, 0.73)
 data_knot = load_sed_Fnu("mydata.csv", unit="mJy")
 data_ext = load_sed_Fnu("mydata_ext.csv", unit="mJy")
 
@@ -34,32 +37,58 @@ print(f"Knot: {len(data_knot)} points, upper limits: {data_knot.has_upper_limits
 print(f"Ext:  {len(data_ext)} points, upper limits: {data_ext.has_upper_limits}")
 
 # ------------------------------------------------------------------ #
-#  Fixed parameters                                                   #
+#  Fixed parameters (arXiv:1509.04822)                                #
 # ------------------------------------------------------------------ #
 
 FIXED_COMMON = dict(
-    q_ratio=1.0, theta=12.0,
-    gamma_min=1e2, gamma_max=1e6,
+    q_ratio=1.0, p=2.5,
+    gamma_min=10.0, gamma_max=1e5,
     z=2.5, eta_e=0.1,
 )
 
-FIXED_KNOT_GEOM = {"Rj": 10 * kpc, "l": 10 * kpc}
-FIXED_EXT_GEOM  = {"Rj": 50 * kpc, "l": 80 * kpc}
+FIXED_KNOT_GEOM = {"Rj": 3 * kpc, "l": 3 * kpc}
+FIXED_EXT_GEOM  = {"Rj": 3 * kpc, "l": 80 * kpc}
 
 # ------------------------------------------------------------------ #
-#  Sampled parameters (shared between knot and extended jet)          #
+#  Sampled parameters                                                 #
+#                                                                     #
+#  Layout of flat vector x:                                           #
+#    [theta, log10_Lj_knot, log10_Lj_ext, G0_knot, G0_ext]           #
+#                                                                     #
+#  theta is SHARED.                                                   #
+#  log10_Lj and G0 are INDEPENDENT per component.                     #
 # ------------------------------------------------------------------ #
 
 SAMPLED = {
-    "G0":  (2.0,   30.0),
-    "p":   (2.0,    3.5),
-    "Lj":  (1e46,  1e50),
+    "theta":         (3.0,  20.0),
+    "log10_Lj_knot": (47.0, 49.5),
+    "log10_Lj_ext":  (47.0, 49.5),
+    "G0_knot":       (3.0,  20.0),
+    "G0_ext":        (5.0,  28.0),
 }
 
 param_names = list(SAMPLED.keys())
 ndim = len(param_names)
 lo = jnp.array([SAMPLED[k][0] for k in param_names])
 hi = jnp.array([SAMPLED[k][1] for k in param_names])
+
+# Indices for readability
+I_THETA, I_LJK, I_LJE, I_G0K, I_G0E = 0, 1, 2, 3, 4
+
+
+# ------------------------------------------------------------------ #
+#  Map flat vector → two JetParams                                    #
+# ------------------------------------------------------------------ #
+
+def _make_vec_to_params(fixed, lj_index, g0_index):
+    """Closure: builds JetParams from flat vector + fixed dict."""
+    def vec_to_params(x):
+        kw = dict(fixed)
+        kw["theta"] = x[I_THETA]
+        kw["Lj"]    = 10.0 ** x[lj_index]
+        kw["G0"]    = x[g0_index]
+        return make_params(**kw)
+    return vec_to_params
 
 
 def logprior_fn(x):
@@ -69,12 +98,48 @@ def logprior_fn(x):
 
 
 # ------------------------------------------------------------------ #
+#  MAP finder (normalized gradient ascent)                            #
+# ------------------------------------------------------------------ #
+
+def find_map(loglikelihood_fn, x0, bounds_lo, bounds_hi, n_steps=2000, lr=0.01):
+    """Projected gradient ascent with per-parameter normalization.
+
+    Normalizes gradient by the parameter range so all dimensions
+    move at comparable rates.
+    """
+    scale = bounds_hi - bounds_lo  # per-param range
+
+    @jax.jit
+    def step(x):
+        g = jax.grad(loglikelihood_fn)(x)
+        # Normalize: step size is lr * (fraction of parameter range)
+        g_normalized = g / (jnp.abs(g).max() + 1e-30)
+        x_new = x + lr * scale * g_normalized
+        margin = 1e-6 * scale
+        x_new = jnp.clip(x_new, bounds_lo + margin, bounds_hi - margin)
+        return x_new
+
+    x = jnp.array(x0, dtype=jnp.float64)
+    best_x = x
+    best_ll = loglikelihood_fn(x)
+
+    for i in range(n_steps):
+        x = step(x)
+        ll = loglikelihood_fn(x)
+        improved = ll > best_ll
+        best_x = jnp.where(improved, x, best_x)
+        best_ll = jnp.where(improved, ll, best_ll)
+
+    return best_x, best_ll
+
+
+# ------------------------------------------------------------------ #
 #  Run nested sampling for each model                                 #
 # ------------------------------------------------------------------ #
 
 n_live = 500
 num_delete = 50
-num_inner_steps = 5 * ndim
+num_inner_steps = 20 * ndim
 
 models = [MODEL_1A, MODEL_1B, MODEL_2A, MODEL_2B]
 results = {}
@@ -89,19 +154,9 @@ for model_id in models:
     fixed_knot = {**FIXED_COMMON, **FIXED_KNOT_GEOM, "model": int(model_id)}
     fixed_ext  = {**FIXED_COMMON, **FIXED_EXT_GEOM,  "model": int(model_id)}
 
-    def _make_vec_to_params(fixed):
-        """Closure to capture the correct fixed dict."""
-        def vec_to_params(x):
-            kw = dict(fixed)
-            for i, name in enumerate(param_names):
-                kw[name] = x[i]
-            return make_params(**kw)
-        return vec_to_params
+    vec_to_knot = _make_vec_to_params(fixed_knot, I_LJK, I_G0K)
+    vec_to_ext  = _make_vec_to_params(fixed_ext,  I_LJE, I_G0E)
 
-    vec_to_knot = _make_vec_to_params(fixed_knot)
-    vec_to_ext  = _make_vec_to_params(fixed_ext)
-
-    # Build likelihoods (closures capture the model via fixed dicts)
     _loglik_knot = make_log_likelihood(data_knot, cosmo=cosmo, nx=64, ngamma=64)
     _loglik_ext  = make_log_likelihood(data_ext,  cosmo=cosmo, nx=64, ngamma=64)
 
@@ -112,7 +167,24 @@ for model_id in models:
 
     loglikelihood_fn = _make_loglik(vec_to_knot, vec_to_ext, _loglik_knot, _loglik_ext)
 
-    # Set up sampler
+    # --- Find MAP first (fast diagnostic) ---
+    # Starting near paper values: theta~10, Lj~2e48/1e48, G0~9/20
+    x0 = jnp.array([10.0, 48.3, 48.0, 9.0, 20.0])
+    map_x, map_ll = find_map(loglikelihood_fn, x0, lo, hi)
+    print(f"  MAP: theta={map_x[0]:.1f}  log10Lj_k={map_x[1]:.2f}  log10Lj_e={map_x[2]:.2f}  "
+          f"G0_k={map_x[3]:.1f}  G0_e={map_x[4]:.1f}  ->  logL={map_ll:.2f}")
+
+    # --- Seed entire initial population near MAP ---
+    # With peaked likelihoods, uniform samples are useless (logL ~ -1000).
+    # Seed 100% near MAP with wide enough spread to cover the prior.
+    rng_key = jax.random.PRNGKey(42)
+    rng_key, seed_key = jax.random.split(rng_key)
+
+    spread = 0.15 * (hi - lo)  # 15% of range — wide enough to explore
+    initial_population = map_x + spread * jax.random.normal(seed_key, (n_live, ndim))
+    initial_population = jnp.clip(initial_population, lo, hi)
+
+    # --- Run nested sampling ---
     algo = blackjax.nss(
         logprior_fn=logprior_fn,
         loglikelihood_fn=loglikelihood_fn,
@@ -120,20 +192,14 @@ for model_id in models:
         num_inner_steps=num_inner_steps,
     )
 
-    rng_key = jax.random.PRNGKey(42)
-    rng_key, init_key = jax.random.split(rng_key)
-    initial_population = jax.random.uniform(
-        init_key, (n_live, ndim), minval=lo, maxval=hi,
-    )
-
     state = algo.init(initial_population)
-    step = jax.jit(algo.step)
+    step_fn = jax.jit(algo.step)
     dead = []
 
     with tqdm.tqdm(desc=f"{model_name}", unit=" dead") as pbar:
         while not state.integrator.logZ_live - state.integrator.logZ < -3:
             rng_key, subkey = jax.random.split(rng_key)
-            state, dead_info = step(subkey, state)
+            state, dead_info = step_fn(subkey, state)
             dead.append(dead_info)
             pbar.update(num_delete)
 
@@ -161,7 +227,7 @@ for model_id in models:
     print(f"  logZ = {logZ_mean:.2f} +/- {logZ_std:.2f}  |  ESS = {int(ns_ess)}")
     for i, name in enumerate(param_names):
         vals = posterior.position[:, i]
-        print(f"    {name:10s}: {vals.mean():.4g} +/- {vals.std():.4g}")
+        print(f"    {name:12s}: {vals.mean():.4g} +/- {vals.std():.4g}")
 
 
 # ------------------------------------------------------------------ #
@@ -172,7 +238,6 @@ print(f"\n{'='*60}")
 print("  MODEL COMPARISON (Bayesian evidence)")
 print(f"{'='*60}")
 
-# Sort by logZ (highest = preferred)
 ranked = sorted(results.values(), key=lambda r: r["logZ"], reverse=True)
 best_logZ = ranked[0]["logZ"]
 
@@ -192,7 +257,6 @@ for r in ranked:
         interp = "strong evidence against"
     print(f"  {r['name']:<12s} {r['logZ']:>10.2f} {r['logZ_err']:>6.2f} {delta:>+12.2f}  {interp}")
 
-# Jeffreys scale reference
 print()
 print("  Jeffreys scale: |Delta logZ| < 1 inconclusive,")
 print("  1-2.5 weak, 2.5-5 moderate, >5 strong")
@@ -207,7 +271,6 @@ try:
 
     colors = {"MODEL_1A": "C0", "MODEL_1B": "C1", "MODEL_2A": "C2", "MODEL_2B": "C3"}
 
-    # Overlay all posteriors on the same corner plot
     fig_corner = None
     for r in ranked:
         ns_samples = anesthetic.NestedSamples(

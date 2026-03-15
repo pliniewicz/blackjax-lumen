@@ -147,12 +147,13 @@ def load_sed_Fnu(filename: str, unit: str = 'mJy',
 # ------------------------------------------------------------------ #
 
 def _build_loglik_fn(nu_obs, log_flux_obs, log_flux_err, is_upper,
-                     cosmo, nx, ngamma, use_kn):
+                     cosmo, nx, ngamma, use_kn, log_err_floor):
     """Build a pure, JIT-compiled log-likelihood closure over fixed data.
 
     The returned function has signature ``loglik(params) -> float``
     and is JAX-traceable w.r.t. params (suitable for jax.grad, HMC, etc.).
     """
+    log_flux_err = jnp.maximum(log_flux_err, log_err_floor)
     has_ul = jnp.any(is_upper)
 
     @partial(jax.jit)
@@ -176,7 +177,8 @@ def _build_loglik_fn(nu_obs, log_flux_obs, log_flux_err, is_upper,
 
 
 def log_likelihood(params, *, data: SEDData, cosmo: Cosmology,
-                   nx: int = 96, ngamma: int = 128, use_kn: bool = True):
+                   nx: int = 96, ngamma: int = 128, use_kn: bool = True,
+                   log_err_floor: float = 0.01):
     """
     Gaussian log-likelihood in log10(νFν) space.
 
@@ -196,6 +198,10 @@ def log_likelihood(params, *, data: SEDData, cosmo: Cosmology,
         Quadrature orders.
     use_kn : bool
         Include Klein-Nishina corrections.
+    log_err_floor : float
+        Minimum uncertainty in log10(νFν) space.  Prevents a single
+        very precise point from dominating the likelihood.
+        Default 0.01 dex (~2.3% in linear flux).
 
     Returns
     -------
@@ -204,19 +210,24 @@ def log_likelihood(params, *, data: SEDData, cosmo: Cosmology,
     """
     loglik_fn = _build_loglik_fn(
         data.frequencies, data.log_fluxes, data.log_errors,
-        data.upper_limit_mask, cosmo, nx, ngamma, use_kn,
+        data.upper_limit_mask, cosmo, nx, ngamma, use_kn, log_err_floor,
     )
     return loglik_fn(params)
 
 
 def make_log_likelihood(data: SEDData, cosmo: Cosmology,
                         nx: int = 96, ngamma: int = 128,
-                        use_kn: bool = True):
+                        use_kn: bool = True, log_err_floor: float = 0.01):
     """
     Return a compiled ``loglik(params) -> float`` closure.
 
     Use this when evaluating the likelihood many times (e.g. in a
     sampling loop) to avoid rebuilding the closure on every call.
+
+    Parameters
+    ----------
+    log_err_floor : float
+        Minimum uncertainty in log10(νFν) space (default 0.01 dex).
 
     Example
     -------
@@ -226,6 +237,6 @@ def make_log_likelihood(data: SEDData, cosmo: Cosmology,
     """
     return _build_loglik_fn(
         data.frequencies, data.log_fluxes, data.log_errors,
-        data.upper_limit_mask, cosmo, nx, ngamma, use_kn,
+        data.upper_limit_mask, cosmo, nx, ngamma, use_kn, log_err_floor,
     )
 
