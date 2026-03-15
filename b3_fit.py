@@ -226,7 +226,7 @@ fig_corner.iloc[-1, 0].legend(
     bbox_to_anchor=(len(fig_corner), len(fig_corner)),
     loc="lower right", fontsize=9,
 )
-
+fig_corner.savefig("cornerplot.pdf", dpi=250)
 
 # In[ ]:
 
@@ -277,12 +277,5 @@ ax.set_xlim(1e7, 1e26)
 ax.set_ylim(1e-20,1e-10)
 ax.legend(fontsize=10)
 fig.tight_layout()
-# fig.savefig("ns_sed_comparison.pdf", dpi=150)
-# print(f"\nSED plot (best model: {best['name']}) saved to ns_sed_comparison.pdf")
-
-
-# In[ ]:
-
-
-
-
+fig.savefig("ns_sed_comparison.pdf", dpi=250)
+print(f"\nSED plot (best model: {best['name']}) saved to ns_sed_comparison.pdf")
